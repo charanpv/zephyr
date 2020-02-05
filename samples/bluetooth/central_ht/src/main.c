@@ -20,10 +20,12 @@
 #include <bluetooth/uuid.h>
 #include <bluetooth/gatt.h>
 
-static struct bt_conn *default_conn;
 static struct bt_uuid_16 uuid = BT_UUID_INIT_16(0);
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_subscribe_params subscribe_params;
+
+static int initiating;
+static int scan_start(void);
 
 static double pow(double x, double y)
 {
@@ -50,6 +52,9 @@ static u8_t notify_func(struct bt_conn *conn,
 	double temperature;
 	u32_t mantissa;
 	s8_t exponent;
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (!data) {
 		printk("[UNSUBSCRIBED]\n");
@@ -57,12 +62,12 @@ static u8_t notify_func(struct bt_conn *conn,
 		return BT_GATT_ITER_STOP;
 	}
 
-	/* temperature value display */
+	/* Temperature value display */
 	mantissa = sys_get_le24(&((u8_t *)data)[1]);
 	exponent = ((u8_t *)data)[4];
 	temperature = (double)mantissa * pow(10, exponent);
 
-	printf("Temperature %gC.\n", temperature);
+	printf("%s: Temperature %gC.\n", addr, temperature);
 
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -76,7 +81,7 @@ static u8_t discover_func(struct bt_conn *conn,
 	if (!attr) {
 		printk("Discover complete\n");
 		(void)memset(params, 0, sizeof(*params));
-		return BT_GATT_ITER_STOP;
+		goto disconnect_and_scan;
 	}
 
 	printk("[ATTRIBUTE] handle %u\n", attr->handle);
@@ -90,6 +95,7 @@ static u8_t discover_func(struct bt_conn *conn,
 		err = bt_gatt_discover(conn, &discover_params);
 		if (err) {
 			printk("Discover failed (err %d)\n", err);
+			goto disconnect_and_scan;
 		}
 	} else if (!bt_uuid_cmp(discover_params.uuid,
 				BT_UUID_HTS_MEASUREMENT)) {
@@ -102,6 +108,7 @@ static u8_t discover_func(struct bt_conn *conn,
 		err = bt_gatt_discover(conn, &discover_params);
 		if (err) {
 			printk("Discover failed (err %d)\n", err);
+			goto disconnect_and_scan;
 		}
 	} else {
 		subscribe_params.notify = notify_func;
@@ -111,44 +118,27 @@ static u8_t discover_func(struct bt_conn *conn,
 		err = bt_gatt_subscribe(conn, &subscribe_params);
 		if (err && err != -EALREADY) {
 			printk("Subscribe failed (err %d)\n", err);
+			goto disconnect_and_scan;
 		} else {
 			printk("[SUBSCRIBED]\n");
+			goto restart_scan;
 		}
-
-		return BT_GATT_ITER_STOP;
 	}
 
 	return BT_GATT_ITER_STOP;
-}
 
-static void connected(struct bt_conn *conn, u8_t conn_err)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-	int err;
+disconnect_and_scan:
+	bt_conn_disconnect(conn, BT_HCI_ERR_LOCALHOST_TERM_CONN);
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+restart_scan:
+	initiating = 0;
 
-	if (conn_err) {
-		printk("Failed to connect to %s (%u)\n", addr, conn_err);
-		return;
+	err = scan_start();
+	if (err) {
+		printk("Scanning failed (%d)\n", err);
 	}
 
-	printk("Connected: %s\n", addr);
-
-	if (conn == default_conn) {
-		memcpy(&uuid, BT_UUID_HTS, sizeof(uuid));
-		discover_params.uuid = &uuid.uuid;
-		discover_params.func = discover_func;
-		discover_params.start_handle = 0x0001;
-		discover_params.end_handle = 0xffff;
-		discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-		err = bt_gatt_discover(default_conn, &discover_params);
-		if (err) {
-			printk("Discover failed(err %d)\n", err);
-			return;
-		}
-	}
+	return BT_GATT_ITER_STOP;
 }
 
 static bool eir_found(struct bt_data *data, void *user_data)
@@ -167,6 +157,7 @@ static bool eir_found(struct bt_data *data, void *user_data)
 		}
 
 		for (i = 0; i < data->data_len; i += sizeof(u16_t)) {
+			struct bt_conn *conn;
 			struct bt_uuid *uuid;
 			u16_t u16;
 			int err;
@@ -183,9 +174,21 @@ static bool eir_found(struct bt_data *data, void *user_data)
 				continue;
 			}
 
-			default_conn =
-				bt_conn_create_le(addr,
-						  BT_LE_CONN_PARAM_DEFAULT);
+			conn = bt_conn_create_le(addr, 
+					BT_LE_CONN_PARAM_DEFAULT);
+			if(!conn) {
+				printk("Create connection failed.");
+
+				err = scan_start();
+				if(err) {
+					printk("Scanning failed (%d)\n",err);
+				}
+			} else {
+				bt_conn_unref(conn);
+
+				initiating = 1;
+			}
+
 			return false;
 		}
 	}
@@ -198,14 +201,18 @@ static void device_found(const bt_addr_le_t *addr, s8_t rssi, u8_t type,
 {
 	char dev[BT_ADDR_LE_STR_LEN];
 
+	if (initiating) {
+		return;
+	}
+
 	bt_addr_le_to_str(addr, dev, sizeof(dev));
 	printk("[DEVICE]: %s, AD evt type %u, AD data len %u, RSSI %i\n",
-	       dev, type, ad->len, rssi);
+	dev, type, ad->len, rssi);
 
-	/* We're only interested in connectable events */
-	if (type == BT_LE_ADV_IND || type == BT_LE_ADV_DIRECT_IND) {
+	/* We are only interested in connectable events */
+	if (type == BT_LE_ADV_IND || type == BT_LE_ADV_DIRECT_IND) {	
 		bt_data_parse(ad, eir_found, (void *)addr);
-	}
+	 }
 }
 
 static int scan_start(void)
@@ -223,6 +230,35 @@ static int scan_start(void)
 	return bt_le_scan_start(&scan_param, device_found);
 }
 
+static void connected(struct bt_conn *conn, u8_t conn_err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	int err;
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (conn_err) {
+		printk("Failed to connect to %s (%u) \n",addr, conn_err);
+		return;
+	}
+
+	printk("Connected: %s\n", addr);
+
+	memcpy(&uuid, BT_UUID_HTS, sizeof(uuid));
+	discover_params.uuid = &uuid.uuid;
+	discover_params.func = discover_func;
+	discover_params.start_handle = 0x0001;
+	discover_params.end_handle = 0xffff;
+	discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+	err = bt_gatt_discover(conn, &discover_params);
+	if (err) {
+		printk("Discover failed (err %d)\n", err);
+
+		bt_conn_disconnect(conn, BT_HCI_ERR_LOCALHOST_TERM_CONN);
+	}
+}
+
 static void disconnected(struct bt_conn *conn, u8_t reason)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -230,24 +266,42 @@ static void disconnected(struct bt_conn *conn, u8_t reason)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	printk("Disconnected: %s (reason 0x%02x)\n", addr, reason);
-
-	if (default_conn != conn) {
-		return;
-	}
-
-	bt_conn_unref(default_conn);
-	default_conn = NULL;
+	printk("Disconnected: %s (reason %u)\n", addr, reason);
 
 	err = scan_start();
 	if (err) {
-		printk("Scanning failed to start (err %d)\n", err);
+		printk("Scanning failed (%d)\n", err);
 	}
+}
+
+static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+	printk("LE conn param req: int (0x%04x, 0x%04x) lat %d to %d\n",
+		param->interval_min, param->interval_max, param->latency,
+		param->timeout);
+
+	return true;
+}
+
+static void le_param_updated(struct bt_conn *conn, u16_t interval,
+		u16_t latency, u16_t timeout)
+{
+	printk("LE conn param updated: int 0x%04x lat %d to %d\n",interval,
+		latency, timeout);
+}
+
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+		enum bt_security_err err)
+{
+	printk("Security changed to level %u\n", level);
 }
 
 static struct bt_conn_cb conn_callbacks = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.le_param_req = le_param_req,
+	.le_param_updated = le_param_updated,
+	.security_changed = security_changed,
 };
 
 void main(void)
@@ -255,6 +309,7 @@ void main(void)
 	int err;
 
 	err = bt_enable(NULL);
+
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
 		return;

@@ -6,9 +6,10 @@ Bluetooth: Central / Health Thermometer sensor
 Overview
 ********
 
-Similar to the :ref:`Central <bluetooth_central>` sample, except that this
-application specifically looks for health thermometer sensor and reports the
+Similar to the :ref:`Central <bluetooth_central>` sample, except that this application specifically looks for multiple peripherals with health thermometer sensor and reports the
 die temperature readings once connected.
+
+It is possible to set the maximum number of peripheral connection to central. To achieve this, set the value for CONFIG_BT_MAX_CONN in prj.conf
 
 Requirements
 ************
