@@ -30,7 +30,7 @@ static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
 		      0x09, 0x18, /* Health Thermometer Service */
 		      0x0a, 0x18, /* Device Information Service */
-		      0x0f, 0x18), /* Battery Service */
+		      0x0f, 0x18) /* Battery Service */
 };
 
 static void connected(struct bt_conn *conn, u8_t err)
@@ -108,6 +108,14 @@ void main(void)
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
+		return;
+	}
+
+	const char *name = bt_get_name();
+
+	err = bt_set_name(name);
+	if (err) {
+		printk("Bluetooth naming failed (err %d)\n", err);
 		return;
 	}
 
